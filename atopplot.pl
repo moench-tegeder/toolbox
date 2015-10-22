@@ -24,6 +24,7 @@ use strict;
 use warnings;
 
 use Getopt::Std;
+use IPC::Cmd qw(can_run);
 use POSIX;
 
 my $dskdevs = [];
@@ -68,7 +69,7 @@ sub main {
   }
 
   if(exists($opts->{'g'})) {
-    $f = findbinary('gnuplot');
+    $f = can_run('gnuplot');
     if(!(defined($f) && -x $f)) {
       print(STDERR 'gnuplot binary not found' . "\n");
       return 1;
@@ -654,23 +655,6 @@ sub do_plot {
   }
 
   return 0;
-}
-
-
-sub findbinary {
-  my $prog = shift;
-  my $path = [ split(':', $ENV{'PATH'}) ];
-  my ($bin, $exe, $p);
-
-  foreach $p (@{$path}) {
-    ($bin = $p . '/' . $prog) =~ s/\/+/\//g;
-    if(-x $bin) {
-      $exe = $bin;
-      last;
-    }
-  }
-
-  return $exe;
 }
 
 
