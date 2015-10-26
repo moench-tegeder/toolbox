@@ -17,7 +17,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-# $Id: atopplot.pl 1516 2015-10-13 09:47:58Z cmt $
+# $Id: atopplot.pl 1519 2015-10-26 21:17:23Z cmt $
 #
 
 use strict;
@@ -58,10 +58,10 @@ sub main {
     'iostat' => []
   };
 
-  getopts($optstr, $opts);
-  if(exists($opts->{'h'})) {
+  $r = getopts($optstr, $opts);
+  if(!$r || exists($opts->{'h'})) {
     usage();
-    return 0;
+    return ($r ? 0 : 1);
   }
   if(exists($opts->{'v'})) {
     version();
@@ -692,8 +692,8 @@ sub usage {
 
 sub version {
   me();
-  print('Version $Revision: 1516 $' . "\n");
-  print('Date $Date: 2015-10-13 11:47:58 +0200 (Tue, 13 Oct 2015) $' . "\n\n");
+  print('Version $Revision: 1519 $' . "\n");
+  print('Date $Date: 2015-10-26 22:17:23 +0100 (Mon, 26 Oct 2015) $' . "\n\n");
 
   return;
 }
