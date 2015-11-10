@@ -41,28 +41,39 @@ sub main {
 sub do_syncs {
   my ($src, $dsts) = (shift, shift);
   my $jobinfo = {};
+  my $args = {};
   my $ret = 0;
-  my ($k, $res, $rsync, $runner);
+  my ($debug, $job, $js, $res, $runner);
 
-  $rsync = can_run('rsync');
-  if(!$rsync) {
-    print(STDERR 'cannot find rsync' . "\n");
-    return 1;
-  }
+  $args = { map { $_ => can_run($_) } (qw(rsync ssh)) };
+  $jobinfo = [
+    map {
+      Internal::Rsync->new({%{$args}, 'src' => $src, 'dst' => $_})
+    } (@{$dsts})
+  ];
 
-  $jobinfo = {
-    map { $_ => [ $rsync, '-a', $src, $_ ] } (@{$dsts})
-  };
+  $debug = exists($ENV{'ARCHIVEDEBUG'}) ? 1 : 0;
+  $runner = Internal::Processor->new($jobinfo);
+  $ret = $runner->execute();
 
-  $runner = Internal::Processor->new({'cmd' => $jobinfo});
-  $res = $runner->execute();
-
-  foreach $k (keys(%{$res})) {
-    if($res->{$k}->{'status'} != 0) {
-      if($ret == 0) {
-        $ret = $res->{$k}->{'status'};
-      }
-      print(STDERR 'failed on ' . $k . ': ' . $res->{$k}->{'output'} . "\n");
+  foreach $job (@{$jobinfo}) {
+    $js = $job->status();
+    if(!defined($js) || $js > 0) {
+      print(STDERR 'ERROR: failure in ' . $job->tag() . "\n");
+    } elsif($debug) {
+      print(STDERR 'DEBUG: ' . $job->tag() . "\n");
+    }
+    if($js > 0) {
+      $ret = ($ret == 0) ? $job->status() : $ret;
+    }
+    if(!defined($js) || $js > 0 || $debug) {
+      print(STDERR $job->output() . "\n");
+    }
+    if($debug) {
+      print(STDERR ' ' . $job->timer() . ' seconds' . "\n");
+    }
+    if(!defined($js) || $js > 0 || $debug) {
+      print(STDERR "\n");
     }
   }
 
@@ -73,135 +84,295 @@ sub do_syncs {
 exit(main());
 
 
-package Internal::Processor;
+package Internal::Cmd;
 
 use strict;
 use warnings;
 
-use IPC::Open3;
-use POSIX;
+use POSIX qw(:sys_wait_h);
+use Storable qw(dclone);
 use Time::HiRes qw(gettimeofday tv_interval);
 
 
 sub new {
   my ($class, $args) = (shift, shift);
+  my $defaults = {
+    '_tag' => '',
+    '_cmd' => [],
+    '_env' => {}
+  };
+  my $self;
+
+  $self = { %{$defaults}, %{$args || {}} };
+  if(@{$self->{'_cmd'}} == 0) {
+    return undef;
+  }
+  if($self->{'_tag'} eq '') {
+    $self->{'_tag'} = join(' ', @{$self->{'_cmd'}});
+  }
+  $self->{'_started'} = undef;
+  $self->{'_runtime'} = 0;
+  $self->{'_pid'} = undef;
+  $self->{'_data_out'} = '';
+  $self->{'_data_err'} = '';
+
+  $self = bless($self, $class);
+
+  return $self;
+}
+
+
+sub cmdline {
+  my $self = shift;
+
+  return dclone($self->{'_cmd'});
+}
+
+
+sub env {
+  my $self = shift;
+
+  return dclone($self->{'_env'});
+}
+
+
+sub tag {
+  my $self = shift;
+
+  return $self->{'_tag'};
+}
+
+
+sub started {
+  my $self = shift;
+
+  if(!$self->{'_started'}) {
+    $self->{'_started'} = [ gettimeofday() ];
+  }
+
+  return;
+}
+
+
+sub stopped {
+  my ($self, $stat) = (shift, shift);
+
+  if(!$self->{'_runtime'} && $self->{'_started'}) {
+    $self->{'_runtime'} = tv_interval($self->{'_started'});
+    $self->{'_exit'} = WIFEXITED($?) ? WEXITSTATUS($?) : undef;
+    $self->{'_signal'} = WIFSIGNALED($?) ? WTERMSIG($?) : undef;
+  }
+
+  return;
+}
+
+
+sub failed {
+  my ($self, $status) = (shift, shift);
+
+  $self->{'_started'} = 0;
+  $self->{'_runtime'} = 0;
+  $self->{'_exit'} = -1;
+  $self->{'_signal'} = 0;
+  $self->{'_data_err'} = $status;
+
+  return;
+}
+
+
+sub status {
+  my $self = shift;
+
+  return $self->{'_exit'};
+}
+
+
+sub output {
+  my $self = shift;
+
+  return $self->{'_data_out'} . "\n" . $self->{'_data_err'};
+}
+
+
+sub timer {
+  my $self = shift;
+
+  return $self->{'_runtime'};
+}
+
+
+sub record {
+  my ($self, $kind, $data) = (shift, shift, shift);
+  my $key;
+
+  if($kind eq 'o') {
+    $key = '_data_out';
+  } elsif($kind eq 'e') {
+    $key = '_data_err';
+  } else {
+    return -1;
+  }
+  $self->{$key}.= $data;
+
+  return 0;
+}
+
+1;
+
+
+package Internal::Rsync;
+
+use strict;
+use warnings;
+
+use IPC::Cmd qw(can_run);
+
+use base qw(Internal::Cmd);
+
+
+sub new {
+  my ($class, $args) = (shift, shift);
+  my $defaults = {
+    'persist' => 60,
+    'timeout' => 5
+  };
+  my $obj = {};
+  my $sshopts = [];
+  my ($cmd, $data, $self, $tag);
+
+  if(!$args || ref($args) ne 'HASH') {
+    return undef;
+  }
+  foreach $tag (qw(src dst)) {
+    if(!$args->{$tag} || ref($args->{$tag}) ne '') {
+      return undef;
+    }
+  }
+  $data = { %{$defaults}, %{$args} };
+  $obj->{'_tag'} = exists($data->{'tag'}) ? $data->{'tag'} : $data->{'dst'};
+
+  foreach $cmd (qw(rsync ssh)) {
+    if($data->{$cmd}) {
+      next;
+    }
+    $data->{$cmd} = can_run($cmd);
+    if(!$data->{$cmd}) {
+      print(STDERR 'cannot find ' . $cmd . "\n");
+      return undef;
+    }
+  }
+
+  $self = { %{$defaults}, %{$args} };
+  $sshopts = [
+    '-o ControlMaster=auto',
+    '-o ControlPath=~/.ssh/%r@%h:%p.sock',
+    '-o ControlPersist=' . $data->{'persist'},
+    '-o ForwardX11=no',
+    '-o ForwardAgent=no',
+    '-o ConnectTimeout=' . $data->{'timeout'}
+  ];
+  $obj->{'_env'} = {
+    'RSYNC_RSH' => join(' ', ($data->{'ssh'}, @{$sshopts}))
+  };
+  $obj->{'_cmd'} = [
+    $data->{'rsync'},
+    exists($ENV{'ARCHIVEDEBUG'}) ? '-av' : '-a',
+    $data->{'src'}, $data->{'dst'}
+  ];
+
+  $self = bless($class->SUPER::new($obj), $class);
+
+  return $self;
+}
+
+1;
+
+
+package Internal::Processor;
+
+use strict;
+use warnings;
+
+use Fcntl;
+use POSIX;
+use POSIX qw(:sys_wait_h);
+use Symbol;
+
+
+sub new {
+  my ($class, $jobs, $args) = (shift, shift, shift);
   my $self = { %{$args || {}} };
 
-  if(!exists($self->{'cmd'})) {
+  if(!defined($jobs) || ref($jobs) ne 'ARRAY') {
     return undef;
   }
   $self = bless($self, $class);
+  $self->{'_jobs'} = {
+    map { $_->tag() => $_ } (@{$jobs})
+  };
+  $self->{'_status'} = {
+    map {
+      $_ => {
+        'or' => gensym(),
+        'ow' => gensym(),
+        'er' => gensym(),
+        'ew' => gensym(),
+        'pid' => undef
+      }
+    } (keys(%{$self->{'_jobs'}}))
+  };
 
-  $self->{'__cmdinfo'} = [];
   $self->{'__active'} = {};
   $self->{'__exits'} = {};
-  $self->{'__nfds'} = 0;
-  $self->{'__fds'} = '';
+  $self->{'_nfds'} = 0;
+  $self->{'_fds'} = '';
 
   return $self;
 }
 
 
 sub execute {
-  my $self = shift;
-  my $cmds = {};
-  my ($i, $ref, $tmp, $r);
-
-  if(ref($self->{'cmd'}) eq 'ARRAY') {
-    $cmds = {
-      'cmd' => $self->{'cmd'}
-    };
-  } elsif(ref($self->{'cmd'}) eq 'HASH') {
-    $cmds = $self->{'cmd'};
-  } else {
-    return undef;
-  }
-
-  $i = 0;
-  foreach $ref (keys(%{$cmds})) {
-    $tmp = {
-      'tag' => $ref,
-      'cmdline' => $cmds->{$ref},
-      'idx' => $i,
-      'pid' => 0,
-      'output' => '',
-      'done' => 0,
-      'start' => 0,
-      'time' => 0,
-      'in' => 'in' . $i,
-      'out' => 'out' . $i,
-      'err' => 'err' . $i
-    };
-    push(@{$self->{'__cmdinfo'}}, $tmp);
-    $i++;
-  }
-
-  $r = $self->run();
-
-  return $r;
-}
-
-
-sub run {
   my ($self, $cmds) = (shift, shift);
-  my ($cmd, $cmdline, $lvl, $pid, $ref, $ret, $status, $tmp);
-  my ($act, $oldact, $oldset, $set, $setchld);
+  my $sptr = $self->{'_status'};
+  my $pids = [];
+  my $ret = 0;
+  my ($cmd, $tag, $r);
+  my ($act, $oldact, $oldset, $set, $chldset);
 
   $oldset = POSIX::SigSet->new();
+  $chldset = POSIX::SigSet->new(SIGCHLD);
   $set = POSIX::SigSet->new(SIGTERM, SIGINT);
   $act = POSIX::SigAction->new(sub { $self->reaper() }, $set);
   $act->safe(1);
   $oldact = POSIX::SigAction->new();
   sigaction(SIGCHLD, $act, $oldact);
 
-  foreach $cmd (@{$self->{'__cmdinfo'}}) {
-    $self->run_cmd($cmd);
+  foreach $tag (keys(%{$self->{'_jobs'}})) {
+    $cmd = $self->{'_jobs'}->{$tag};
+    $r = $self->run_cmd($cmd);
+    $ret = ($r < 0) ? -1 : $ret;
   }
 
-  while($self->{'__nfds'} > 0) {
+  # do not interrupt IO with SIGCHLD
+  while($self->{'_nfds'} > 0) {
+    sigprocmask(SIG_BLOCK, $chldset, $oldset);
     $self->collect_output();
+    sigprocmask(SIG_SETMASK, $oldset);
   }
 
-  while(kill(0, (keys(%{$self->{'__active'}})))) {
-    sleep(1);
-  }
-  
-  sigprocmask(SIG_BLOCK, $setchld);
-  foreach $pid (keys(%{$self->{'__exited'}})) {
-    $cmd = $self->{'__cmdinfo'}->[$self->{'__active'}->{$pid}];
-    $status = $self->{'__exited'}->{$pid}->{'status'};
-    if($status >= 0 && WIFEXITED($status)) {
-      $cmd->{'status'} = WEXITSTATUS($status);
-    } else {
-      $cmd->{'status'} = -1;
+  do {
+    $pids = [
+      map {
+        defined($sptr->{$_}->{'pid'}) ? $sptr->{$_}->{'pid'} : ()
+      } (keys(%{$sptr}))
+    ];
+    $r = kill(0, @{$pids});
+    if($r > 0) {
+      sleep(0.05);
     }
-    if($status >= 0 && WIFSIGNALED($status)) {
-      $cmd->{'signal'} = WTERMSIG($status);
-    } else {
-      $cmd->{'signal'} = 0;
-    }
-    if($status < 0) {
-      $cmd->{'status'} = -1;
-      $cmd->{'signal'} = 0;
-    }
-    $cmd->{'time'} = $self->{'__exited'}->{$pid}->{'time'};
-    delete($self->{'__active'}->{$pid});
-  }
-  $self->{'__exited'} = {};
+  } while($r > 0);
 
-  sigprocmask(SIG_SETMASK, $oldset);
   sigaction(SIGCHLD, $oldact);
-
-  $ret = {
-    map {
-      $_->{'tag'} => {
-        'status' => $_->{'status'},
-        'signal' => $_->{'signal'},
-        'time' => $_->{'time'},
-        'output' => $_->{'output'}
-      }
-    } (@{$self->{'__cmdinfo'}})
-  };
 
   return $ret;
 }
@@ -209,34 +380,64 @@ sub run {
 
 sub run_cmd {
   my ($self, $cmd) = (shift, shift);
-  my ($cmdline, $flags, $pid);
-  $cmdline = $cmd->{'cmdline'};
+  my $cmdline = $cmd->cmdline();
+  my $env = $cmd->env();
+  my $tag = $cmd->tag();
+  my $sptr = $self->{'_status'}->{$tag};
+  my ($fd, $k, $pid, $r);
 
-  eval {
-    $pid = open3($cmd->{'in'}, $cmd->{'out'}, $cmd->{'err'}, @{$cmdline});
-  };
-  if($@ || $pid < 0) {
-    print(STDERR 'command ' . $cmd->{'tag'} . ' failed: ' . ($@ ? $@ : $!));
-    $cmd->{'output'} = $@ ? $@ : $!;
-    $cmd->{'status'} = -1;
-    $cmd->{'done'} = 1;
+  $r = pipe($sptr->{'or'}, $sptr->{'ow'});
+  if(!$r) {
+    $cmd->failed($!);
     return -1;
   }
+  $r = pipe($sptr->{'er'}, $sptr->{'ew'});
+  if(!$r) {
+    $cmd->failed($!);
+    close($sptr->{'or'});
+    close($sptr->{'ow'});
+    return -1;
+  }
+  # +O_NONBLOCK, -FD_CLOEXEC
+  foreach $fd ($sptr->{'or'}, $sptr->{'ow'}, $sptr->{'er'}, $sptr->{'ew'}) {
+    fcntl($fd, F_SETFL, O_NONBLOCK | fcntl($fd, F_GETFL, 0));
+    fcntl($fd, F_SETFD, 0);
+  }
 
-  $cmd->{'pid'} = $pid;
-  $cmd->{'status'} = undef;
-  $cmd->{'start'} = [ gettimeofday() ];
-
-  $flags = fcntl($cmd->{'out'}, F_GETFL, 0);
-  fcntl($cmd->{'out'}, F_SETFL, $flags | O_NONBLOCK);
-  $flags = fcntl($cmd->{'err'}, F_GETFL, 0);
-  fcntl($cmd->{'err'}, F_SETFL, $flags | O_NONBLOCK);
-
-  vec($self->{'__fds'}, fileno($cmd->{'out'}), 1) = 1;
-  vec($self->{'__fds'}, fileno($cmd->{'err'}), 1) = 1;
-  $self->{'__nfds'} += 2;;
-
-  $self->{'__active'}->{$pid} = $cmd->{'idx'};
+  $pid = fork();
+  if(!defined($pid) || $pid < 0) {
+    print(STDERR 'fork failed: ' . $! . "\n");
+    $cmd->failed($!);
+    close($sptr->{'or'});
+    close($sptr->{'ow'});
+    close($sptr->{'er'});
+    close($sptr->{'ew'});
+    return -1;
+  } elsif($pid == 0) {
+    # child
+    foreach $k (keys(%{$env})) {
+      $ENV{$k} = $env->{$k};
+    }
+    open(STDIN, '<', '/dev/null');
+    open(STDOUT, '>&', $sptr->{'ow'});
+    open(STDERR, '>&', $sptr->{'ew'});
+    $fd = select(STDOUT);
+    $| = 1;
+    select(STDERR);
+    $| = 1;
+    select($fd);
+    close($sptr->{'or'});
+    close($sptr->{'er'});
+    exec { $cmdline->[0] } (@{$cmdline}); # does not return
+  } else {
+    $cmd->started();
+    $self->{'_status'}->{$tag}->{'pid'} = $pid;
+    $self->{'_nfds'}++;
+    vec($self->{'_fds'}, fileno($sptr->{'or'}), 1) = 1;
+    vec($self->{'_fds'}, fileno($sptr->{'er'}), 1) = 1;
+    close($sptr->{'ow'});
+    close($sptr->{'ew'});
+  }
 
   return 0;
 }
@@ -244,17 +445,20 @@ sub run_cmd {
 
 sub collect_output {
   my $self = shift;
-  my $fds = $self->{'__fds'};
+  my $fds = $self->{'_fds'};
+  my $status = $self->{'_status'};
   my $buf = '';
-  my ($c, $fd, $r);
+  my ($cmd, $fd, $k, $tag, $r);
 
   $r = select($fds, undef, undef, 0.1);
-  if(!$r) {
+  if($r == -1 || $r == 0) {
     return;
   }
 
-  foreach $c (@{$self->{'__cmdinfo'}}) {
-    foreach $fd ($c->{'out'}, $c->{'err'}) {
+  foreach $tag (keys(%{$status})) {
+    $cmd = $self->{'_jobs'}->{$tag};
+    foreach $k (qw(or er)) {
+      $fd = $self->{'_status'}->{$tag}->{$k};
       if(!(defined($fd) && defined(fileno($fd)))) {
         next;
       }
@@ -266,12 +470,11 @@ sub collect_output {
         if(!defined($r) && $! == EAGAIN) {
           next;
         } elsif($r > 0) {
-          $c->{'output'}.= $buf;
-          $buf = '';
+          $cmd->record(substr($k, 0, 1), $buf);
         } else {
-          vec($self->{'__fds'}, fileno($fd), 1) = 0;
+          vec($self->{'_fds'}, fileno($fd), 1) = 0;
           close($fd);
-          $self->{'__nfds'}--;
+          $self->{'_nfds'}--;
         }
       } while(defined($r) && $r > 0);
     }
@@ -283,16 +486,24 @@ sub collect_output {
 
 sub reaper {
   my $self = shift;
-  my ($idx, $pid);
+  my $sptr = $self->{'_status'};
+  my ($cmd, $pid, $tag, $status);
 
   do {
     $pid = waitpid(-1, WNOHANG);
     if($pid > 0) {
-      $idx = $self->{'__active'}->{$pid};
-      $self->{'__exited'}->{$pid} = {
-        'status' => $?,
-        'time' => tv_interval($self->{'__cmdinfo'}->[$idx]->{'start'})
-      };
+      $status = $?;
+      $tag = [
+        grep {
+          defined($sptr->{$_}->{'pid'}) && $sptr->{$_}->{'pid'} == $pid
+        } (keys(%{$sptr}))
+      ];
+      if(scalar(@{$tag}) == 0) {
+        next;
+      }
+      $cmd = $self->{'_jobs'}->{$tag->[0]};
+      $cmd->stopped($status);
+      $sptr->{$tag->[0]}->{'pid'} = undef;
     }
   } while($pid > 0);
 
