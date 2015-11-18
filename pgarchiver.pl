@@ -30,6 +30,10 @@ sub main {
   my $dst = [];
   my ($src, $r);
 
+  if(!$ENV{'PATH'}) {
+    $ENV{'PATH'} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  }
+
   $src = shift(@ARGV);
   $dst = [ @ARGV ];
   $r = do_syncs($src, $dst);
@@ -366,9 +370,13 @@ sub execute {
         defined($sptr->{$_}->{'pid'}) ? $sptr->{$_}->{'pid'} : ()
       } (keys(%{$sptr}))
     ];
-    $r = kill(0, @{$pids});
-    if($r > 0) {
-      sleep(0.05);
+    if(scalar(@{$pids}) > 0) {
+      $r = kill(0, @{$pids});
+      if($r > 0) {
+        sleep(0.05);
+      }
+    } else {
+      $r = 0;
     }
   } while($r > 0);
 
