@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 #
 # atopplot.pl - generate graphs from atop data using gnuplot
 #
