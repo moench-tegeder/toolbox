@@ -28,10 +28,11 @@ use IPC::Cmd qw(can_run);
 
 sub main {
   my $dst = [];
+  my $fbpath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
   my ($src, $r);
 
   if(!$ENV{'PATH'}) {
-    $ENV{'PATH'} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    $ENV{'PATH'} = $fbpath;
   }
 
   $src = shift(@ARGV);
@@ -365,11 +366,14 @@ sub execute {
   }
 
   do {
+    # the process list shouldn't be changed while we're iterating over it
+    sigprocmask(SIG_BLOCK, $chldset, $oldset);
     $pids = [
       map {
         defined($sptr->{$_}->{'pid'}) ? $sptr->{$_}->{'pid'} : ()
       } (keys(%{$sptr}))
     ];
+    sigprocmask(SIG_SETMASK, $oldset);
     if(scalar(@{$pids}) > 0) {
       $r = kill(0, @{$pids});
       if($r > 0) {
@@ -406,6 +410,7 @@ sub run_cmd {
     close($sptr->{'ow'});
     return -1;
   }
+
   # +O_NONBLOCK, -FD_CLOEXEC
   foreach $fd ($sptr->{'or'}, $sptr->{'ow'}, $sptr->{'er'}, $sptr->{'ew'}) {
     fcntl($fd, F_SETFL, O_NONBLOCK | fcntl($fd, F_GETFL, 0));
