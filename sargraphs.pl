@@ -653,7 +653,11 @@ sub _plot_data {
         exit(1);
       }
       $idx = 1 + $keys->{uc($func) . '_' . $c->{'key'} . '_' . $t->{'dev'}};
-      $d = $self->{'devices'}->{$t->{'dev'}};
+      if(exists($self->{'devices'}->{$t->{'dev'}})) {
+        $d = $self->{'devices'}->{$t->{'dev'}};
+      } else {
+        $d = $t->{'dev'};
+      }
       $col = 1 + $i % 10;
       $str = sprintf($fmt, $idx, $c->{'axis'}, $c->{'descr'}, $d, $style, $col);
       push(@{$plot}, $str);
