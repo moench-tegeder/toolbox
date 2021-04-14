@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 #
-# sargraphs.pl - generate graphs from atop data using gnuplot
+# sargraphs.pl - generate graphs from sar data using gnuplot
 #
 # (c) 2020 Christoph Moench-Tegeder <cmt@burggraben.net>
 #
